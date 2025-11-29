@@ -8,10 +8,7 @@ export const updateLastAlertTime = (id: number, time: Date) => {
   ]);
 };
 
-// Helper to deactivate a reminder (NEW)
+// Helper to deactivate a reminder
 export const deactivateReminder = (id: number, title: string) => {
   db.run("UPDATE reminders SET is_active = 0 WHERE id = ?", [id]);
-  console.log(
-    `REMINDER DEACTIVATED: '${title}' finished its schedule or was stale.`
-  );
 };

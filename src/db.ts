@@ -20,12 +20,12 @@ db.run(`
   )
 `);
 
-try {
-  db.run("ALTER TABLE reminders ADD COLUMN last_alert_time TEXT");
-  console.log("Migration: Added column 'last_alert_time'.");
-} catch (e) {}
+// try {
+//   db.run("ALTER TABLE reminders ADD COLUMN last_alert_time TEXT");
+//   console.log("Migration: Added column 'last_alert_time'.");
+// } catch (e) {}
 
-try {
-  db.run("ALTER TABLE reminders ADD COLUMN is_active INTEGER DEFAULT 1");
-  console.log("Migration: Added column 'is_active'.");
-} catch (e) {}
+// try {
+//   db.run("ALTER TABLE reminders ADD COLUMN is_active INTEGER DEFAULT 1");
+//   console.log("Migration: Added column 'is_active'.");
+// } catch (e) {}

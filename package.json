@@ -13,6 +13,7 @@
     "@sendgrid/mail": "^8.1.6",
     "cron-parser": "^5.4.0",
     "elysia": "^1.4.16",
-    "nodemailer": "^7.0.10"
+    "nodemailer": "^7.0.10",
+    "zod": "^4.1.13"
   }
 }

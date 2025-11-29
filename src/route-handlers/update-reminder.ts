@@ -1,10 +1,10 @@
 import { type Context } from "elysia";
-import type { Reminder } from "../types";
 import { db } from "../db";
 import { getReminderById } from "./route-helpers";
+import type { TCreateReminderInput } from "../schemas";
 
 export const updateReminderRoute = ({ params: { id }, body, set }: Context) => {
-  const r = body as Reminder;
+  const r = body as TCreateReminderInput;
   const existing = getReminderById(Number(id));
 
   if (!existing) {
@@ -17,7 +17,7 @@ export const updateReminderRoute = ({ params: { id }, body, set }: Context) => {
         title = $title, date = $date, location = $location, description = $description, 
         reminders = $reminders, alerts = $alerts, is_recurring = $is_recurring, 
         recurrence = $recurrence, start_date = $start_date, end_date = $end_date,
-        is_active = $is_active -- ADDED
+        is_active = $is_active
       WHERE id = $id
     `);
 
@@ -33,11 +33,10 @@ export const updateReminderRoute = ({ params: { id }, body, set }: Context) => {
     $recurrence: r.recurrence ?? null,
     $start_date: r.start_date ?? null,
     $end_date: r.end_date ?? null,
-    $is_active: r.is_active === false ? 0 : 1, // Ensure update respects explicit deactivation
+    $is_active: r.is_active === false ? 0 : 1,
   };
 
   try {
-    // Execute with defensive bindings
     stmt.run(bindings as any);
   } catch (dbError) {
     console.error("Database Update Error:", dbError);

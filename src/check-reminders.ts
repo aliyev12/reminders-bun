@@ -3,6 +3,8 @@ import { sendEmail } from "./email-handlers";
 import { getReminders } from "./route-handlers";
 import { deactivateReminder, updateLastAlertTime } from "./utils";
 
+const SCHEDULER_INTERVAL = Number(process.env.SCHEDULER_INTERVAL) || 3000;
+
 export const checkReminders = async () => {
   const reminders = getReminders();
   const now = new Date();
@@ -24,7 +26,9 @@ export const checkReminders = async () => {
         // --- DEACTIVATION LOGIC FOR RECURRING EVENTS ---
         if (r.end_date && eventTime.getTime() > r.end_date.getTime()) {
           // If the *next* occurrence is past the end_date, deactivate the reminder.
-          console.log("line 135 deactivateReminder");
+          console.log(
+            `DEACTIVATING RECURRING REMINDER: '${r.title}' as it passed end_date.`
+          );
           deactivateReminder(r.id!, r.title);
           continue; // Skip processing this reminder further in this cycle
         }
@@ -40,20 +44,21 @@ export const checkReminders = async () => {
       // If a one-time event has already alerted, deactivate it and skip.
       if (r.last_alert_time) {
         // --- DEACTIVATION LOGIC FOR ONE-TIME EVENTS ---
-        console.log("line 151 deactivateReminder");
+        console.log(
+          `DEACTIVATING ONE-TIME REMINDER: '${r.title}' as it has already alerted.`
+        );
         deactivateReminder(r.id!, r.title);
         continue; // Skip processing this reminder further in this cycle
         // --- END DEACTIVATION LOGIC ---
       }
 
-      // ADDED: Stale one-time event check (passed due)
+      // Stale one-time event check (passed due)
+      // If the event time is more than an hour in the past and it has never alerted, consider it stale.
       if (eventTime.getTime() < now.getTime() - 60 * 60 * 1000) {
         // If event was missed by more than an hour and never alerted, deactivate to prevent stale check.
-        console.log("line 160 deactivateReminder");
         deactivateReminder(r.id!, r.title);
-        // We log the specific stale message here, even though deactivateReminder logs a general one.
         console.log(
-          `STALE REMINDER DEACTIVATED: '${r.title}' was missed and never alerted.`
+          `DEACTIVATING STALE ONE-TIME REMINDER: '${r.title}' as it was missed an hour ago and never alerted.`
         );
         continue;
       }
@@ -66,10 +71,8 @@ export const checkReminders = async () => {
 
       const diff = now.getTime() - alertTime.getTime();
 
-      // Check if the alert was triggered in the last cycle (0s <= diff < 3000ms based on your 3s interval)
-      if (diff >= 0 && diff < 3000) {
-        // Changed 60000ms to 3000ms to match your setInterval of 3000ms
-
+      // Check if the alert was triggered in the last cycle (0s <= diff < 3000ms based on 3s interval)
+      if (diff >= 0 && diff < SCHEDULER_INTERVAL) {
         // Final check: If recurring, make sure we haven't alerted for this specific event time yet.
         if (
           r.is_recurring &&
@@ -86,13 +89,11 @@ export const checkReminders = async () => {
 
         for (const contact of r.reminders) {
           if (contact.mode === "email") {
-            // Use the unified sendEmail function
             await sendEmail(contact.address, r.title, r.description);
           }
         }
 
         // Acknowledge the alert by setting the last_alert_time to NOW
-        // NOTE: r.id is guaranteed to be non-null here as it came from the DB.
         updateLastAlertTime(r.id!, now);
 
         // Break out of the alerts loop to prevent multiple alerts for the same event in one run

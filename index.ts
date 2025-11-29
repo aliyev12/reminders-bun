@@ -1,13 +1,14 @@
 import { Elysia } from "elysia";
 import { checkReminders } from "./src/check-reminders";
-import { routes, getReminders } from "./src/route-handlers";
 import { unprotectedRoutes } from "./src/constants";
+import { routes } from "./src/route-handlers";
 
 const API_KEY = process.env.APP_API_KEY;
 const PORT = process.env.APP_PORT;
+const SCHEDULER_INTERVAL = Number(process.env.SCHEDULER_INTERVAL) || 3000;
 
-// Start Scheduler (runs every 3s as per your current setting)
-setInterval(checkReminders, 3000);
+// Start Scheduler (runs every 3s)
+setInterval(checkReminders, SCHEDULER_INTERVAL);
 console.log("Scheduler started.");
 
 const app = new Elysia()
@@ -28,13 +29,14 @@ const app = new Elysia()
     if (routeIsUnprotected) return;
 
     const apiKey = request.headers.get("x-api-key");
+
     if (apiKey !== API_KEY) {
       set.status = 401;
       return { error: "Invalid or missing API Key" };
     }
   })
-  .get("/reminders", () => getReminders().filter((r) => r.is_active))
-  .get("/reminders/all", () => getReminders())
+  .get("/reminders", routes.getActiveRemindersRoute)
+  .get("/reminders/all", routes.getAllRemindersRoute)
   .get("/reminders/:id", routes.getReminderByIdRoute)
   .post("/reminders", routes.createReminderRoute)
   .put("/reminders/:id", routes.updateReminderRoute)

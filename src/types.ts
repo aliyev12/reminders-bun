@@ -18,3 +18,8 @@ export interface Reminder {
   last_alert_time?: Date | null;
   is_active?: boolean;
 }
+
+export interface IUnprotectedRoute {
+  method: string;
+  pathname: string;
+}
