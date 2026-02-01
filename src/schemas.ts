@@ -24,7 +24,7 @@ const ReminderBaseSchema = z.object({
   date: z
     .string()
     .describe(
-      "Date of the reminder, it has to be using UTC format, for example: 2025-11-29T03:03:53Z"
+      "Date of the reminder, it has to be using UTC format, for example: 2025-11-29T03:03:53Z",
     ),
   location: z
     .string()
@@ -104,12 +104,25 @@ export const DeleteReminderOutputSchema = z.object({
     .string()
     .optional()
     .describe("Error message if the delete operation failed"),
-  deletedReminder: ReminderSchema.optional().describe(
-    "The reminder that was deleted"
-  ),
+  deletedReminder: z
+    .array(ReminderSchema)
+    .optional()
+    .describe("The reminder that was deleted"),
 });
 
 export type TDeleteReminderOutput = z.infer<typeof DeleteReminderOutputSchema>;
+
+export const DeleteRemindersBulkOutputSchema = z.object({
+  status: z.string().describe("Status of the delete operation"),
+  error: z
+    .string()
+    .optional()
+    .describe("Error message if the delete operation failed"),
+});
+
+export type TDeleteRemindersBulkOutput = z.infer<
+  typeof DeleteRemindersBulkOutputSchema
+>;
 
 export const ReminderDTOSchema = z.object({
   ...ReminderSchema.shape,

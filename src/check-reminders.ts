@@ -8,7 +8,7 @@ const SCHEDULER_INTERVAL = Number(process.env.SCHEDULER_INTERVAL) || 3000;
 export const checkReminders = async () => {
   const reminders = getReminders();
   const now = new Date();
-  console.log("Now = ", now);
+  // console.log("reminders = ", reminders);
 
   for (const r of reminders) {
     // Only process reminders that are active
@@ -31,7 +31,7 @@ export const checkReminders = async () => {
           if (eventTime.getTime() > endDate.getTime()) {
             // If the *next* occurrence is past the end_date, deactivate the reminder.
             console.log(
-              `DEACTIVATING RECURRING REMINDER: '${r.title}' as it passed end_date.`
+              `DEACTIVATING RECURRING REMINDER: '${r.title}' as it passed end_date.`,
             );
             deactivateReminder(r.id!, r.title);
             continue; // Skip processing this reminder further in this cycle
@@ -45,13 +45,12 @@ export const checkReminders = async () => {
     } else {
       // Use the fixed date for one-time events
       eventTime = new Date(r.date);
-      console.log("Event Time = ", eventTime);
 
       // If a one-time event has already alerted, deactivate it and skip.
       if (r.last_alert_time) {
         // --- DEACTIVATION LOGIC FOR ONE-TIME EVENTS ---
         console.log(
-          `DEACTIVATING ONE-TIME REMINDER: '${r.title}' as it has already alerted.`
+          `DEACTIVATING ONE-TIME REMINDER: '${r.title}' as it has already alerted.`,
         );
         deactivateReminder(r.id!, r.title);
         continue; // Skip processing this reminder further in this cycle
@@ -64,7 +63,7 @@ export const checkReminders = async () => {
         // If event was missed by more than an hour and never alerted, deactivate to prevent stale check.
         deactivateReminder(r.id!, r.title);
         console.log(
-          `DEACTIVATING STALE ONE-TIME REMINDER: '${r.title}' as it was missed an hour ago and never alerted.`
+          `DEACTIVATING STALE ONE-TIME REMINDER: '${r.title}' as it was missed an hour ago and never alerted.`,
         );
         continue;
       }
@@ -90,7 +89,7 @@ export const checkReminders = async () => {
         }
 
         console.log(
-          `ALERT TRIGGERED for '${r.title}'! Sending notifications...`
+          `ALERT TRIGGERED for '${r.title}'! Sending notifications...`,
         );
 
         for (const contact of r.reminders) {
