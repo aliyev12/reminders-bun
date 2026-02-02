@@ -80,7 +80,7 @@ function hasAlreadyAlertedForEvent(
 ): boolean
 ```
 
-#### Step 1.3: Create Notification Service
+#### Step 1.3: Create Notification Service ✅ DONE
 
 Separate notification concerns:
 

@@ -1,4 +1,3 @@
-import { sendEmail } from "./email-handlers";
 import { getReminders } from "./route-handlers";
 import { deactivateReminder, updateLastAlertTime } from "./utils";
 import {
@@ -7,6 +6,7 @@ import {
   calculateNextEventTime,
   getAlertsToFire,
 } from "./scheduler/helpers";
+import { sendNotifications } from "./scheduler/notification-service";
 
 const SCHEDULER_INTERVAL = Number(process.env.SCHEDULER_INTERVAL) || 3000;
 
@@ -71,15 +71,8 @@ export const checkReminders = async () => {
         `ALERT TRIGGERED for '${reminder.title}'! Sending notifications...`,
       );
 
-      for (const contact of reminder.reminders) {
-        if (contact.mode === "email") {
-          await sendEmail(
-            contact.address,
-            reminder.title,
-            reminder.description,
-          );
-        }
-      }
+      // Send notifications to all contacts
+      await sendNotifications(reminder, reminder.reminders);
 
       // Acknowledge the alert by setting the last_alert_time to NOW
       updateLastAlertTime(reminder.id!, now);
