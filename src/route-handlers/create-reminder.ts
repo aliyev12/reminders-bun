@@ -1,8 +1,12 @@
 import { type Context } from "elysia";
 import { db } from "../db";
 import type { TCreateReminderInput } from "../schemas";
+import {
+  scheduleReminderAlert,
+  scheduleRecurringReminder,
+} from "../qstash/scheduler";
 
-export const createReminderRoute = ({ body, set }: Context) => {
+export const createReminderRoute = async ({ body, set }: Context) => {
   const r = body as TCreateReminderInput;
 
   if (r.is_recurring && (!r.recurrence || !r.start_date)) {
@@ -56,6 +60,31 @@ export const createReminderRoute = ({ body, set }: Context) => {
     set.status = 201;
 
     console.log(`Successfully created a new reminder: ${r.title}!`);
+
+    // After successfully inserting the reminder, schedule the alerts:
+
+    // For recurring reminders
+    if (r.is_recurring && r.recurrence) {
+      await scheduleRecurringReminder(insertedId, r.recurrence);
+    }
+
+    // For one-time reminders or first alert of recurring
+    if (r.alerts && r.alerts.length > 0) {
+      const reminderDate = new Date(r.date);
+
+      for (const alert of r.alerts) {
+        const alertTime = new Date(reminderDate.getTime() - alert.time);
+
+        // Only schedule if alert time is in the future
+        if (alertTime > new Date()) {
+          await scheduleReminderAlert({
+            reminderId: insertedId,
+            alertTime,
+            title: r.title,
+          });
+        }
+      }
+    }
 
     return { id: insertedId, ...r };
   } else {

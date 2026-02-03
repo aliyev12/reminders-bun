@@ -3,14 +3,22 @@ import { checkReminders } from "./src/check-reminders";
 import { unprotectedRoutes } from "./src/constants";
 import { routes } from "./src/route-handlers";
 import { cors } from "@elysiajs/cors";
+import { webhookReminderAlertRoute } from "./src/route-handlers/webhook-reminder-alert";
 
 const API_KEY = process.env.APP_API_KEY;
 const PORT = process.env.APP_PORT;
 const SCHEDULER_INTERVAL = Number(process.env.SCHEDULER_INTERVAL) || 3000;
+const USE_POLLING = process.env.USE_POLLING === "true";
 
-// Start Scheduler (runs every 3s)
-setInterval(checkReminders, SCHEDULER_INTERVAL);
-console.log("Scheduler started.");
+// Only use polling in development when QStash isn't configured
+if (USE_POLLING || !process.env.QSTASH_TOKEN) {
+  // Start Scheduler (runs every 3s)
+  setInterval(checkReminders, SCHEDULER_INTERVAL);
+  console.log(`Polling scheduler started (interval: ${SCHEDULER_INTERVAL}ms)`);
+  console.log("Note: In production, use QStash instead of polling");
+} else {
+  console.log("QStash scheduler active - polling disabled");
+}
 
 const app = new Elysia()
   .use(
@@ -66,6 +74,7 @@ const app = new Elysia()
   .get("/reminders/all", routes.getAllRemindersRoute)
   .get("/reminders/:id", routes.getReminderByIdRoute)
   .post("/reminders", routes.createReminderRoute)
+  .post("/webhooks/reminder-alert", webhookReminderAlertRoute)
   .put("/reminders/:id", routes.updateReminderRoute)
   .delete("/reminders/:id", routes.deleteReminderRoute)
   .delete("/reminders/bulk", routes.deleteRemindersBulkRoute)

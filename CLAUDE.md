@@ -131,3 +131,10 @@ Optional:
 6. **UTC dates everywhere** - All dates stored and processed in UTC ISO format
 7. **Type safety first** - TypeScript strict mode enabled, Zod provides runtime validation
 8. **Modular handlers** - New routes should follow the pattern: create file in `route-handlers/`, export from `route-handlers/index.ts`, register in `index.ts`
+
+# Process Management Rules
+- NEVER leave background services or servers running after a task is complete.
+- If you start a dev server (e.g., `bun run dev`), ensure it is killed before finishing the task.
+- Before starting a new server on a port (e.g., 8080), check if it is already in use using `lsof -i :8080`.
+- If a port is blocked, kill the occupying process before proceeding.
+- Use `trap 'kill %1' EXIT` in bash scripts to ensure children are cleaned up.

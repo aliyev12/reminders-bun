@@ -1,606 +1,1401 @@
 # Reminders Server - Improvement Roadmap
 
-This document outlines a phased approach to improving the reminders server from an MVP to a production-ready application while maintaining simplicity.
+This document outlines a phased approach to deploying the reminders server **for free** on Render.com.
 
 ---
 
 ## Executive Summary
 
-The current implementation works but has three main areas for improvement:
-1. **Scheduler Architecture**: Replace `setInterval` with a more robust scheduling approach
-2. **Core Logic Refactoring**: Clean up the `checkReminders()` function for maintainability
-3. **General Code Quality**: Apply production-ready patterns across the codebase
+**Goal**: Deploy a working reminder app for free on Render.com for personal use (1-2 reminders/week).
+
+**Key Strategy**: Replace `setInterval` polling with **Upstash QStash** - a free serverless scheduler that wakes up your sleeping Render server exactly when reminders are due.
+
+**Why This Works**:
+- Render free tier sleeps after 15 minutes → That's fine, we don't poll anymore
+- QStash calls your webhook at the scheduled time → Wakes up Render
+- Server sends notification → Goes back to sleep
+- 1,000 free messages/day → You need ~2/week
+
+---
+
+## Architecture Comparison
+
+### Before: Polling (Problematic for Free Tier)
+
+```
+┌─────────────────────────────────────────────┐
+│  Render Server (needs to stay awake)        │
+│  ┌────────────────────────────────────────┐ │
+│  │  setInterval(checkReminders, 3000)     │ │
+│  │  ↓                                     │ │
+│  │  Query DB → Check times → Send emails  │ │
+│  └────────────────────────────────────────┘ │
+└─────────────────────────────────────────────┘
+Problem: Server sleeps after 15 min on free tier!
+```
+
+### After: Event-Driven with QStash (Works with Free Tier)
+
+```
+┌─────────────┐     1. Create reminder      ┌─────────────┐
+│   Client    │ ─────────────────────────→  │   Render    │
+└─────────────┘                             │   Server    │
+                                            └──────┬──────┘
+                                                   │ 2. Schedule callback
+                                                   ↓
+                                            ┌─────────────┐
+                                            │   QStash    │
+                                            │  (stores)   │
+                                            └──────┬──────┘
+                                                   │ 3. At reminder time,
+                                                   │    call webhook
+                                                   ↓
+┌─────────────┐     4. Send notification    ┌─────────────┐
+│    Email    │ ←─────────────────────────  │   Render    │
+│   Service   │                             │  (woken up) │
+└─────────────┘                             └─────────────┘
+
+Server can sleep! QStash wakes it when needed.
+```
 
 ---
 
 ## Phase 1: Refactor checkReminders() Function ✅ COMPLETE
 
-**Priority: HIGH** | **Risk: MEDIUM** | **Complexity: MEDIUM**
+**Status: DONE** - Clean, maintainable code with clear separation of concerns.
 
-The `checkReminders()` function has been successfully refactored into clean, maintainable code with clear separation of concerns.
+---
 
-### Previous Problems (Now Resolved ✅)
+## Phase 2: QStash Integration (Replace setInterval) ✅ COMPLETE
 
-1. ~~**Mixed responsibilities**~~: Now separated into single-responsibility functions
-2. ~~**Deep nesting**~~: Replaced with early returns and clear step-by-step flow
-3. ~~**Implicit business rules**~~: Now explicit constants in `SCHEDULER_CONFIG`
-4. ~~**No separation between recurring and one-time logic**~~: Now handled via `checkDeactivation()` router function
+**Priority: HIGH** | **Risk: LOW** | **Complexity: LOW**
 
-### Implemented Refactoring Strategy
+### Why QStash?
 
-#### Step 1.1: Extract Configuration Constants ✅ DONE
+| Feature | QStash Free Tier | Your Needs |
+|---------|------------------|------------|
+| Messages/day | 1,000 | ~2/week |
+| Max delay | 7 days | Enough for most reminders |
+| Active schedules | 10 | For recurring reminders |
+| Max retries | 3 | Handles failures |
+| Cost | **$0** | Perfect |
 
-Create a dedicated config section for business rule constants:
+### Step 2.1: Create Upstash Account and Get Credentials
+
+1. Go to [console.upstash.com](https://console.upstash.com)
+2. Sign up (free)
+3. Go to QStash tab
+4. Copy your `QSTASH_TOKEN` and `QSTASH_CURRENT_SIGNING_KEY` and `QSTASH_NEXT_SIGNING_KEY`
+
+### Step 2.2: Install QStash SDK
+
+```bash
+bun add @upstash/qstash
+```
+
+### Step 2.3: Create QStash Client
+
+**File:** `src/qstash/client.ts`
 
 ```typescript
-// src/scheduler/config.ts
-export const SCHEDULER_CONFIG = {
-  STALE_THRESHOLD_MS: 60 * 60 * 1000,  // 1 hour
-  INTERVAL_MS: Number(process.env.SCHEDULER_INTERVAL) || 3000,
+import { Client } from "@upstash/qstash";
+
+if (!process.env.QSTASH_TOKEN) {
+  console.warn("QSTASH_TOKEN not set - QStash scheduling disabled");
+}
+
+export const qstash = process.env.QSTASH_TOKEN
+  ? new Client({ token: process.env.QSTASH_TOKEN })
+  : null;
+
+/**
+ * Get the base URL for webhook callbacks.
+ * In production, this is your Render URL.
+ * In development, you'll need a tunnel (ngrok, localtunnel, etc.)
+ */
+export function getWebhookBaseUrl(): string {
+  if (process.env.WEBHOOK_BASE_URL) {
+    return process.env.WEBHOOK_BASE_URL;
+  }
+
+  // Default for local development
+  return `http://localhost:${process.env.PORT || 8080}`;
+}
+```
+
+### Step 2.4: Create Webhook Signature Verification
+
+**File:** `src/qstash/verify.ts`
+
+```typescript
+import { Receiver } from "@upstash/qstash";
+
+const receiver = new Receiver({
+  currentSigningKey: process.env.QSTASH_CURRENT_SIGNING_KEY || "",
+  nextSigningKey: process.env.QSTASH_NEXT_SIGNING_KEY || "",
+});
+
+/**
+ * Verify that a webhook request came from QStash.
+ * Returns true if valid, false if invalid or verification disabled.
+ */
+export async function verifyQStashSignature(
+  signature: string | null,
+  body: string
+): Promise<boolean> {
+  // Skip verification in development or if keys not set
+  if (process.env.NODE_ENV === "development") {
+    return true;
+  }
+
+  if (!signature || !process.env.QSTASH_CURRENT_SIGNING_KEY) {
+    console.warn("QStash signature verification skipped - keys not configured");
+    return true;
+  }
+
+  try {
+    await receiver.verify({ signature, body });
+    return true;
+  } catch (error) {
+    console.error("QStash signature verification failed:", error);
+    return false;
+  }
+}
+```
+
+### Step 2.5: Create Scheduler Service
+
+**File:** `src/qstash/scheduler.ts`
+
+```typescript
+import { qstash, getWebhookBaseUrl } from "./client";
+
+interface ScheduleReminderOptions {
+  reminderId: number;
+  alertTime: Date; // When to trigger the alert
+  title: string; // For logging
+}
+
+interface ScheduleResult {
+  success: boolean;
+  messageId?: string;
+  error?: string;
+}
+
+/**
+ * Schedule a reminder alert using QStash.
+ * QStash will call our webhook at the specified time.
+ */
+export async function scheduleReminderAlert(
+  options: ScheduleReminderOptions
+): Promise<ScheduleResult> {
+  const { reminderId, alertTime, title } = options;
+
+  if (!qstash) {
+    console.log(`[DEV] Would schedule reminder ${reminderId} for ${alertTime.toISOString()}`);
+    return { success: true, messageId: "dev-mode" };
+  }
+
+  const webhookUrl = `${getWebhookBaseUrl()}/webhooks/reminder-alert`;
+  const delaySeconds = Math.max(0, Math.floor((alertTime.getTime() - Date.now()) / 1000));
+
+  // If the alert time is in the past or very soon, trigger immediately
+  if (delaySeconds <= 0) {
+    console.log(`Alert time for '${title}' is now or past, triggering immediately`);
+  }
+
+  try {
+    const response = await qstash.publishJSON({
+      url: webhookUrl,
+      body: { reminderId, alertTime: alertTime.toISOString() },
+      delay: delaySeconds > 0 ? delaySeconds : undefined,
+      retries: 3,
+    });
+
+    console.log(`Scheduled alert for '${title}' at ${alertTime.toISOString()} (in ${delaySeconds}s)`);
+
+    return { success: true, messageId: response.messageId };
+  } catch (error) {
+    console.error(`Failed to schedule alert for '${title}':`, error);
+    return { success: false, error: (error as Error).message };
+  }
+}
+
+/**
+ * Schedule a recurring reminder using QStash cron schedules.
+ * Used for reminders with cron expressions.
+ */
+export async function scheduleRecurringReminder(
+  reminderId: number,
+  cronExpression: string
+): Promise<ScheduleResult> {
+  if (!qstash) {
+    console.log(`[DEV] Would schedule recurring reminder ${reminderId} with cron: ${cronExpression}`);
+    return { success: true, messageId: "dev-mode" };
+  }
+
+  const webhookUrl = `${getWebhookBaseUrl()}/webhooks/reminder-alert`;
+
+  try {
+    const response = await qstash.schedules.create({
+      destination: webhookUrl,
+      cron: cronExpression,
+      body: JSON.stringify({ reminderId, isRecurring: true }),
+      retries: 3,
+    });
+
+    console.log(`Created recurring schedule for reminder ${reminderId}: ${cronExpression}`);
+
+    return { success: true, messageId: response.scheduleId };
+  } catch (error) {
+    console.error(`Failed to create recurring schedule for ${reminderId}:`, error);
+    return { success: false, error: (error as Error).message };
+  }
+}
+
+/**
+ * Cancel a scheduled message or recurring schedule.
+ */
+export async function cancelScheduledReminder(
+  messageId: string
+): Promise<boolean> {
+  if (!qstash) {
+    console.log(`[DEV] Would cancel scheduled message: ${messageId}`);
+    return true;
+  }
+
+  try {
+    // Try to cancel as a message first
+    await qstash.messages.delete(messageId);
+    return true;
+  } catch {
+    try {
+      // If that fails, try as a schedule
+      await qstash.schedules.delete(messageId);
+      return true;
+    } catch (error) {
+      console.error(`Failed to cancel scheduled reminder ${messageId}:`, error);
+      return false;
+    }
+  }
+}
+```
+
+### Step 2.6: Create Webhook Endpoint
+
+**File:** `src/route-handlers/webhook-reminder-alert.ts`
+
+```typescript
+import type { Context } from "elysia";
+import { verifyQStashSignature } from "../qstash/verify";
+import { getReminderById } from "./route-helpers";
+import { sendNotifications } from "../scheduler/notification-service";
+import { deactivateReminder, updateLastAlertTime } from "../utils";
+
+interface WebhookPayload {
+  reminderId: number;
+  alertTime?: string;
+  isRecurring?: boolean;
+}
+
+export const webhookReminderAlertRoute = async ({ request, body, set }: Context) => {
+  // Verify the request came from QStash
+  const signature = request.headers.get("upstash-signature");
+  const rawBody = JSON.stringify(body);
+
+  const isValid = await verifyQStashSignature(signature, rawBody);
+  if (!isValid) {
+    set.status = 401;
+    return { error: "Invalid signature" };
+  }
+
+  const payload = body as WebhookPayload;
+  const { reminderId, isRecurring } = payload;
+
+  console.log(`Webhook received for reminder ${reminderId}`);
+
+  // Get the reminder
+  const reminder = getReminderById(reminderId);
+
+  if (!reminder) {
+    console.log(`Reminder ${reminderId} not found - may have been deleted`);
+    return { status: "skipped", reason: "reminder_not_found" };
+  }
+
+  if (!reminder.is_active) {
+    console.log(`Reminder ${reminderId} is inactive - skipping`);
+    return { status: "skipped", reason: "inactive" };
+  }
+
+  // Send notifications
+  console.log(`Sending notifications for '${reminder.title}'`);
+  await sendNotifications(reminder, reminder.reminders);
+
+  // Update last alert time
+  updateLastAlertTime(reminder.id!, new Date());
+
+  // Deactivate one-time reminders after sending
+  if (!isRecurring && !reminder.is_recurring) {
+    deactivateReminder(reminder.id!, reminder.title);
+    console.log(`One-time reminder '${reminder.title}' deactivated`);
+  }
+
+  return { status: "ok", reminderTitle: reminder.title };
 };
 ```
 
-#### Step 1.2: Create Pure Helper Functions ✅ DONE
+### Step 2.7: Update Create Reminder to Schedule with QStash
 
-Extract logic into small, testable functions:
+**File:** `src/route-handlers/create-reminder.ts` (update)
 
-```typescript
-// src/scheduler/helpers/
-
-// Determines if a one-time reminder should be deactivated
-function shouldDeactivateOneTime(reminder: TReminder, now: Date): {
-  shouldDeactivate: boolean;
-  reason?: string
-}
-
-// Determines if a recurring reminder should be deactivated
-function shouldDeactivateRecurring(
-  reminder: TReminder,
-  nextEventTime: Date
-): { shouldDeactivate: boolean; reason?: string }
-
-// Calculates the next event time for any reminder type
-function calculateNextEventTime(
-  reminder: TReminder,
-  now: Date
-): Date | null
-
-// Determines which alerts should fire right now
-function getAlertsToFire(
-  reminder: TReminder,
-  eventTime: Date,
-  now: Date,
-  intervalMs: number
-): Alert[]
-
-// Checks if we've already alerted for this event instance
-function hasAlreadyAlertedForEvent(
-  reminder: TReminder,
-  alertTime: Date
-): boolean
-```
-
-#### Step 1.3: Create Notification Service ✅ DONE
-
-Separate notification concerns:
+Add QStash scheduling after creating the reminder:
 
 ```typescript
-// src/scheduler/notification-service.ts
-export async function sendNotifications(
-  reminder: TReminder,
-  contacts: Contact[]
-): Promise<void>
+import { scheduleReminderAlert, scheduleRecurringReminder } from "../qstash/scheduler";
+
+// After successfully inserting the reminder, schedule the alerts:
+
+// For recurring reminders
+if (r.is_recurring && r.recurrence) {
+  await scheduleRecurringReminder(insertedId, r.recurrence);
+}
+
+// For one-time reminders or first alert of recurring
+if (r.alerts && r.alerts.length > 0) {
+  const reminderDate = new Date(r.date);
+
+  for (const alert of r.alerts) {
+    const alertTime = new Date(reminderDate.getTime() - alert.time);
+
+    // Only schedule if alert time is in the future
+    if (alertTime > new Date()) {
+      await scheduleReminderAlert({
+        reminderId: insertedId,
+        alertTime,
+        title: r.title,
+      });
+    }
+  }
+}
 ```
 
-#### Step 1.4: Rewrite Main Function with Clear Flow ✅ DONE
+### Step 2.8: Register Webhook Route
 
-Refactored into clean, single-responsibility functions:
+**File:** `index.ts` (update)
 
 ```typescript
-// src/check-reminders.ts
-export async function checkReminders(): Promise<void> {
-  const reminders = getReminders();
-  const now = new Date();
+import { webhookReminderAlertRoute } from "./src/route-handlers/webhook-reminder-alert";
 
-  for (const reminder of reminders) {
-    await processReminder(reminder, now);
-  }
-}
+// Add webhook route (no auth required - QStash signature verification handles security)
+.post("/webhooks/reminder-alert", webhookReminderAlertRoute)
+```
 
-async function processReminder(reminder: TReminder, now: Date): Promise<void> {
-  // Skip inactive reminders
-  if (!reminder.is_active) return;
-  if (!reminder.alerts || reminder.alerts.length === 0) return;
+### Step 2.9: Update Environment Variables
 
-  // Step 1: Calculate next event time
-  const eventTime = calculateNextEventTime(reminder, now);
-  if (!eventTime) return;
+**File:** `.env.example` (add)
 
-  // Step 2: Check if reminder should be deactivated
-  const deactivation = checkDeactivation(reminder, eventTime, now);
-  if (deactivation.shouldDeactivate) {
-    deactivateReminder(reminder.id!, reminder.title);
-    console.log(`DEACTIVATING: '${reminder.title}' - ${deactivation.reason}`);
-    return;
-  }
+```bash
+# QStash (Upstash) - For scheduling reminders
+# Get these from console.upstash.com -> QStash
+QSTASH_TOKEN=your-qstash-token
+QSTASH_CURRENT_SIGNING_KEY=your-current-signing-key
+QSTASH_NEXT_SIGNING_KEY=your-next-signing-key
 
-  // Step 3: Process alerts
-  await processAlerts(reminder, eventTime, now);
-}
+# Webhook URL (your Render.com URL in production)
+# Not needed locally if using dev mode
+WEBHOOK_BASE_URL=https://your-app.onrender.com
+```
 
-function checkDeactivation(
-  reminder: TReminder,
-  eventTime: Date,
-  now: Date
-): { shouldDeactivate: boolean; reason?: string } {
-  if (reminder.is_recurring && reminder.recurrence) {
-    return shouldDeactivateRecurring(reminder, eventTime);
-  }
-  return shouldDeactivateOneTime(reminder, now);
-}
+### Step 2.10: Remove setInterval (Production) / Keep for Dev
 
-async function processAlerts(
-  reminder: TReminder,
-  eventTime: Date,
-  now: Date
-): Promise<void> {
-  const alertsToFire = getAlertsToFire(
-    reminder,
-    eventTime,
-    now,
-    SCHEDULER_CONFIG.INTERVAL_MS
-  );
+**File:** `index.ts` (update)
 
-  if (alertsToFire.length > 0) {
-    console.log(`ALERT TRIGGERED for '${reminder.title}'! Sending notifications...`);
-    await sendNotifications(reminder, reminder.reminders);
-    updateLastAlertTime(reminder.id!, now);
-  }
+```typescript
+import { checkReminders } from "./src/check-reminders";
+
+const SCHEDULER_INTERVAL = Number(process.env.SCHEDULER_INTERVAL) || 3000;
+const USE_POLLING = process.env.USE_POLLING === "true";
+
+// Only use polling in development when QStash isn't configured
+if (USE_POLLING || !process.env.QSTASH_TOKEN) {
+  setInterval(checkReminders, SCHEDULER_INTERVAL);
+  console.log(`Polling scheduler started (interval: ${SCHEDULER_INTERVAL}ms)`);
+  console.log("Note: In production, use QStash instead of polling");
+} else {
+  console.log("QStash scheduler active - polling disabled");
 }
 ```
 
-#### Step 1.5: Actual File Structure After Refactoring ✅ DONE
+### Step 2.11: Local Development with QStash (Optional)
 
-```
-src/
-├── check-reminders.ts        # Main orchestrator (refactored with clear flow)
-├── utils.ts                  # Contains deactivateReminder and updateLastAlertTime
-├── scheduler/
-│   ├── config.ts             # Business rule constants (STALE_THRESHOLD_MS, INTERVAL_MS)
-│   ├── notification-service.ts  # Notification sending logic
-│   └── helpers/
-│       ├── index.ts          # Exports all helper functions
-│       ├── calculateNextEventTime.ts
-│       ├── shouldDeactivateOneTime.ts
-│       ├── shouldDeactivateRecurring.ts
-│       ├── getAlertsToFire.ts
-│       └── hasAlreadyAlertedForEvent.ts
+For testing QStash locally, you need a public URL. Options:
+
+**Option A: Use polling locally (recommended for simplicity)**
+```bash
+USE_POLLING=true bun run index.ts
 ```
 
-**Note:** Deactivation logic (`deactivateReminder`, `updateLastAlertTime`) remains in `src/utils.ts` as it's used across the application, not just by the scheduler.
+**Option B: Use localtunnel for QStash testing**
+```bash
+# Terminal 1: Start your server
+bun run index.ts
 
-### Testing Strategy for Phase 1 ✅ VERIFIED
+# Terminal 2: Create tunnel
+npx localtunnel --port 8080
 
-Manual testing confirmed:
-1. ✅ One-time reminders fire alerts correctly and send emails
-2. ✅ Deactivation logic works as expected (one-time reminders deactivate after alerting)
-3. ✅ Console logging provides clear visibility: "ALERT TRIGGERED" and "DEACTIVATING" messages
-4. ✅ All behavior preserved from original implementation
-5. ✅ Code is now significantly more readable and maintainable
+# Set WEBHOOK_BASE_URL to the tunnel URL
+```
 
-### Phase 1 Summary
+### Testing Phase 2
 
-**Achievements:**
-- Reduced `checkReminders()` from 82 lines of deeply nested code to a clean 99-line file with 4 focused functions
-- Created 7 reusable helper functions in modular files
-- Extracted configuration constants for maintainability
-- Separated notification concerns into dedicated service
-- Added comprehensive JSDoc comments for all functions
-- Achieved the goal: **"Read checkReminders() and understand it in under 2 minutes"** ✅
-
-**Files Modified:**
-- `src/check-reminders.ts` - Complete refactoring
-- `src/scheduler/config.ts` - Added INTERVAL_MS constant
-- `src/scheduler/helpers/shouldDeactivateOneTime.ts` - Fixed return type consistency
-
-**Next Steps:** Ready to proceed with Phase 2 (Scheduler Resilience) or Phase 5 (Testing Foundation)
+1. Create Upstash account and get QStash credentials
+2. Set environment variables
+3. Create a reminder with an alert 1 minute in the future
+4. Check QStash dashboard - should see scheduled message
+5. Wait for the callback - should receive notification
+6. Check that one-time reminder is deactivated
 
 ---
 
-## Phase 2: Improve Scheduler Architecture
+## Phase 3: Repository Pattern (Simplified)
 
 **Priority: MEDIUM** | **Risk: LOW** | **Complexity: LOW**
 
-### Current Approach: `setInterval`
+### Goal
+Decouple database operations for future flexibility (PostgreSQL, etc.).
+
+### Step 3.1: Create Repository Interface
+
+**File:** `src/repositories/reminder-repository.interface.ts`
 
 ```typescript
-setInterval(checkReminders, 3000);
+import type { TReminder, TCreateReminderInput } from "../schemas";
+
+export interface IReminderRepository {
+  findAll(): TReminder[];
+  findActive(): TReminder[];
+  findById(id: number): TReminder | null;
+  create(data: TCreateReminderInput): { id: number };
+  update(id: number, data: Partial<TCreateReminderInput>): boolean;
+  delete(id: number): boolean;
+  deleteBulk(ids: number[]): number;
+  deactivate(id: number): boolean;
+  updateLastAlertTime(id: number, time: Date): boolean;
+}
 ```
 
-**Problems:**
-- If an iteration takes longer than 3 seconds, iterations can overlap
-- No error isolation - an unhandled error could crash the scheduler
-- No visibility into scheduler health
-- Drift over time (not aligned to clock)
+### Step 3.2: Create SQLite Implementation
 
-### Recommendation: Keep `setInterval` but Add Resilience
-
-For a simple reminder app, `setInterval` is actually fine. The key issues are:
-1. **Overlap prevention**: Ensure one check finishes before the next starts
-2. **Error isolation**: Catch and log errors without crashing
-3. **Health monitoring**: Know if the scheduler is running
-
-**Why NOT use a full job queue (Bull/BullMQ)?**
-- Requires Redis infrastructure
-- Overkill for this use case
-- Adds deployment complexity
-
-**Why NOT use node-cron?**
-- Your scheduler needs to run every 3 seconds (too frequent for typical cron)
-- Cron expressions only go down to minute-level precision
-- No real benefit over setInterval for this use case
-
-### Proposed Implementation
-
-#### Step 2.1: Create Scheduler Service with Resilience
+**File:** `src/repositories/sqlite-reminder-repository.ts`
 
 ```typescript
-// src/scheduler/scheduler-service.ts
-class SchedulerService {
-  private isRunning = false;
-  private intervalId: Timer | null = null;
-  private lastRunAt: Date | null = null;
-  private consecutiveErrors = 0;
+import { db } from "../db";
+import type { IReminderRepository } from "./reminder-repository.interface";
+import type { TReminder, TReminderDTO, TCreateReminderInput } from "../schemas";
 
-  start(): void {
-    if (this.intervalId) return;
+export class SQLiteReminderRepository implements IReminderRepository {
 
-    this.intervalId = setInterval(() => this.tick(), SCHEDULER_CONFIG.INTERVAL_MS);
-    console.log('Scheduler started');
-  }
-
-  stop(): void {
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
-      this.intervalId = null;
-    }
-  }
-
-  private async tick(): Promise<void> {
-    // Prevent overlapping runs
-    if (this.isRunning) {
-      console.warn('Previous scheduler run still in progress, skipping');
-      return;
-    }
-
-    this.isRunning = true;
-    try {
-      await checkReminders();
-      this.lastRunAt = new Date();
-      this.consecutiveErrors = 0;
-    } catch (error) {
-      this.consecutiveErrors++;
-      console.error('Scheduler error:', error);
-
-      // Alert if too many consecutive errors
-      if (this.consecutiveErrors >= 5) {
-        console.error('CRITICAL: Scheduler has failed 5 times in a row');
-      }
-    } finally {
-      this.isRunning = false;
-    }
-  }
-
-  getStatus(): { isRunning: boolean; lastRunAt: Date | null; errors: number } {
+  private transformRow(row: TReminderDTO): TReminder {
     return {
-      isRunning: this.isRunning,
-      lastRunAt: this.lastRunAt,
-      errors: this.consecutiveErrors,
+      ...row,
+      location: row.location ? JSON.parse(row.location) : null,
+      reminders: row.reminders ? JSON.parse(row.reminders) : [],
+      alerts: row.alerts ? JSON.parse(row.alerts) : [],
+      is_recurring: !!row.is_recurring,
+      is_active: !!row.is_active,
     };
   }
+
+  findAll(): TReminder[] {
+    const results = db.query("SELECT * FROM reminders").all() as TReminderDTO[];
+    return results.map(this.transformRow);
+  }
+
+  findActive(): TReminder[] {
+    const results = db
+      .query("SELECT * FROM reminders WHERE is_active = 1")
+      .all() as TReminderDTO[];
+    return results.map(this.transformRow);
+  }
+
+  findById(id: number): TReminder | null {
+    const row = db
+      .query("SELECT * FROM reminders WHERE id = $id")
+      .get({ $id: id }) as TReminderDTO | null;
+    return row ? this.transformRow(row) : null;
+  }
+
+  create(data: TCreateReminderInput): { id: number } {
+    const stmt = db.prepare(`
+      INSERT INTO reminders (
+        title, date, location, description, reminders, alerts,
+        is_recurring, recurrence, start_date, end_date, is_active
+      ) VALUES (
+        $title, $date, $location, $description, $reminders, $alerts,
+        $is_recurring, $recurrence, $start_date, $end_date, $is_active
+      )
+    `);
+
+    stmt.run({
+      $title: data.title,
+      $date: data.date,
+      $location: data.location ? JSON.stringify(data.location) : null,
+      $description: data.description,
+      $reminders: JSON.stringify(data.reminders ?? []),
+      $alerts: JSON.stringify(data.alerts ?? []),
+      $is_recurring: data.is_recurring ? 1 : 0,
+      $recurrence: data.recurrence ?? null,
+      $start_date: data.start_date ?? null,
+      $end_date: data.end_date ?? null,
+      $is_active: data.is_active !== false ? 1 : 0,
+    });
+
+    const result = db.query("SELECT last_insert_rowid() as id").get() as { id: number };
+    return { id: result.id };
+  }
+
+  update(id: number, data: Partial<TCreateReminderInput>): boolean {
+    const fields: string[] = [];
+    const values: Record<string, unknown> = { $id: id };
+
+    if (data.title !== undefined) {
+      fields.push("title = $title");
+      values.$title = data.title;
+    }
+    if (data.date !== undefined) {
+      fields.push("date = $date");
+      values.$date = data.date;
+    }
+    if (data.location !== undefined) {
+      fields.push("location = $location");
+      values.$location = JSON.stringify(data.location);
+    }
+    if (data.description !== undefined) {
+      fields.push("description = $description");
+      values.$description = data.description;
+    }
+    if (data.reminders !== undefined) {
+      fields.push("reminders = $reminders");
+      values.$reminders = JSON.stringify(data.reminders);
+    }
+    if (data.alerts !== undefined) {
+      fields.push("alerts = $alerts");
+      values.$alerts = JSON.stringify(data.alerts);
+    }
+    if (data.is_recurring !== undefined) {
+      fields.push("is_recurring = $is_recurring");
+      values.$is_recurring = data.is_recurring ? 1 : 0;
+    }
+    if (data.recurrence !== undefined) {
+      fields.push("recurrence = $recurrence");
+      values.$recurrence = data.recurrence;
+    }
+    if (data.start_date !== undefined) {
+      fields.push("start_date = $start_date");
+      values.$start_date = data.start_date;
+    }
+    if (data.end_date !== undefined) {
+      fields.push("end_date = $end_date");
+      values.$end_date = data.end_date;
+    }
+    if (data.is_active !== undefined) {
+      fields.push("is_active = $is_active");
+      values.$is_active = data.is_active ? 1 : 0;
+    }
+
+    if (fields.length === 0) return false;
+
+    const sql = `UPDATE reminders SET ${fields.join(", ")} WHERE id = $id`;
+    const result = db.run(sql, values);
+    return result.changes > 0;
+  }
+
+  delete(id: number): boolean {
+    const result = db.run("DELETE FROM reminders WHERE id = ?", [id]);
+    return result.changes > 0;
+  }
+
+  deleteBulk(ids: number[]): number {
+    if (ids.length === 0) return 0;
+    const placeholders = ids.map(() => "?").join(",");
+    const result = db.run(`DELETE FROM reminders WHERE id IN (${placeholders})`, ids);
+    return result.changes;
+  }
+
+  deactivate(id: number): boolean {
+    const result = db.run("UPDATE reminders SET is_active = 0 WHERE id = ?", [id]);
+    return result.changes > 0;
+  }
+
+  updateLastAlertTime(id: number, time: Date): boolean {
+    const result = db.run(
+      "UPDATE reminders SET last_alert_time = ? WHERE id = ?",
+      [time.toISOString(), id]
+    );
+    return result.changes > 0;
+  }
+}
+```
+
+### Step 3.3: Create Repository Factory
+
+**File:** `src/repositories/index.ts`
+
+```typescript
+import type { IReminderRepository } from "./reminder-repository.interface";
+import { SQLiteReminderRepository } from "./sqlite-reminder-repository";
+
+let repository: IReminderRepository | null = null;
+
+export function getReminderRepository(): IReminderRepository {
+  if (!repository) {
+    repository = new SQLiteReminderRepository();
+  }
+  return repository;
 }
 
-export const scheduler = new SchedulerService();
+export type { IReminderRepository };
 ```
 
-#### Step 2.2: Add Health Check Endpoint
+### Step 3.4: Update All Route Handlers
 
-```typescript
-// In index.ts
-.get('/health', () => {
-  const schedulerStatus = scheduler.getStatus();
-  return {
-    status: 'ok',
-    scheduler: schedulerStatus,
-    uptime: process.uptime(),
-  };
-})
-```
-
-#### Step 2.3: Graceful Shutdown
-
-```typescript
-// In index.ts
-process.on('SIGTERM', () => {
-  console.log('Received SIGTERM, shutting down gracefully');
-  scheduler.stop();
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  console.log('Received SIGINT, shutting down gracefully');
-  scheduler.stop();
-  process.exit(0);
-});
-```
-
----
-
-## Phase 3: Code Quality Improvements
-
-**Priority: MEDIUM** | **Risk: LOW** | **Complexity: LOW**
-
-### Step 3.1: Add Request Validation with Elysia
-
-Currently, route handlers cast `body as TCreateReminderInput` without validation. Use Elysia's built-in validation:
+Replace direct DB calls with repository calls. Example:
 
 ```typescript
 // Before
-.post("/reminders", routes.createReminderRoute)
+import { db } from "../db";
+const results = db.query("SELECT * FROM reminders").all();
 
 // After
-.post("/reminders", routes.createReminderRoute, {
-  body: t.Object({
-    title: t.String(),
-    date: t.String(),
-    description: t.String(),
-    // ... rest of schema
-  })
-})
-```
-
-Or use the `elysia-zod` plugin to integrate your existing Zod schemas.
-
-### Step 3.2: Environment-based CORS
-
-```typescript
-// src/config.ts
-export const CONFIG = {
-  cors: {
-    origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
-  },
-  // ... other config
-};
-```
-
-### Step 3.3: Structured Logging
-
-Replace `console.log` with a simple structured logger:
-
-```typescript
-// src/logger.ts
-type LogLevel = 'info' | 'warn' | 'error' | 'debug';
-
-interface LogEntry {
-  timestamp: string;
-  level: LogLevel;
-  message: string;
-  context?: Record<string, unknown>;
-}
-
-export const logger = {
-  info: (message: string, context?: Record<string, unknown>) =>
-    log('info', message, context),
-  warn: (message: string, context?: Record<string, unknown>) =>
-    log('warn', message, context),
-  error: (message: string, context?: Record<string, unknown>) =>
-    log('error', message, context),
-  debug: (message: string, context?: Record<string, unknown>) =>
-    log('debug', message, context),
-};
-
-function log(level: LogLevel, message: string, context?: Record<string, unknown>) {
-  const entry: LogEntry = {
-    timestamp: new Date().toISOString(),
-    level,
-    message,
-    context,
-  };
-  console.log(JSON.stringify(entry));
-}
-```
-
-### Step 3.4: Remove Dead Code
-
-- Remove commented-out code block in `index.ts` (lines 30-45)
-- Clean up any unused imports
-
-### Step 3.5: Add Type Safety to Route Handlers
-
-Ensure all route handlers have explicit return types and proper error handling.
-
----
-
-## Phase 4: Database Improvements
-
-**Priority: LOW** | **Risk: MEDIUM** | **Complexity: MEDIUM**
-
-### Step 4.1: Add Database Migrations
-
-Create a simple migration system for schema changes:
-
-```
-src/
-├── db/
-│   ├── index.ts          # Database connection
-│   ├── migrations/
-│   │   ├── 001_initial.sql
-│   │   └── 002_add_indexes.sql
-│   └── migrate.ts        # Migration runner
-```
-
-### Step 4.2: Add Indexes for Performance
-
-```sql
-CREATE INDEX IF NOT EXISTS idx_reminders_is_active ON reminders(is_active);
-CREATE INDEX IF NOT EXISTS idx_reminders_date ON reminders(date);
-```
-
-### Step 4.3: Repository Pattern (Optional)
-
-Consider extracting database operations into a repository:
-
-```typescript
-// src/repositories/reminder-repository.ts
-export const reminderRepository = {
-  findAll: () => getReminders(),
-  findById: (id: number) => getReminderById(id),
-  findActive: () => getReminders().filter(r => r.is_active),
-  create: (data: TCreateReminderInput) => { /* ... */ },
-  update: (id: number, data: Partial<TReminder>) => { /* ... */ },
-  delete: (id: number) => { /* ... */ },
-  deactivate: (id: number) => { /* ... */ },
-  updateLastAlertTime: (id: number, time: Date) => { /* ... */ },
-};
+import { getReminderRepository } from "../repositories";
+const repo = getReminderRepository();
+const results = repo.findAll();
 ```
 
 ---
 
-## Phase 5: Testing Foundation
+## Phase 4: Authentication with Better Auth
 
-**Priority: HIGH** | **Risk: LOW** | **Complexity: MEDIUM**
+**Priority: HIGH** | **Risk: MEDIUM** | **Complexity: MEDIUM**
 
-### Step 5.1: Set Up Test Infrastructure
+### Goal
+Secure the API with proper session-based authentication. No credentials exposed in browser network tab.
+
+### Why Better Auth?
+
+| Feature | API Key | Better Auth |
+|---------|---------|-------------|
+| Visible in browser DevTools | **Yes** (insecure) | No (cookies are httpOnly) |
+| Session management | Manual | Built-in |
+| Password hashing | N/A | Built-in (bcrypt) |
+| Future multi-user support | Difficult | Easy |
+| CSRF protection | None | Built-in |
+
+### Step 4.1: Install Better Auth
 
 ```bash
-bun add -d bun:test
+bun add better-auth
 ```
 
-Create test structure:
+### Step 4.2: Create Auth Configuration
 
+**File:** `src/auth/index.ts`
+
+```typescript
+import { betterAuth } from "better-auth";
+import Database from "bun:sqlite";
+
+// Use the same database as reminders
+const DB_PATH = process.env.DATABASE_PATH || "reminders.db";
+
+export const auth = betterAuth({
+  database: new Database(DB_PATH),
+  emailAndPassword: {
+    enabled: true,
+    requireEmailVerification: false, // Keep simple for personal use
+  },
+  session: {
+    expiresIn: 60 * 60 * 24 * 30, // 30 days
+    updateAge: 60 * 60 * 24, // Update session every 24 hours
+    cookieCache: {
+      enabled: true,
+      maxAge: 60 * 5, // 5 minutes
+    },
+  },
+  trustedOrigins: [
+    process.env.CORS_ORIGIN || "http://localhost:3000",
+  ],
+});
+
+// Export type for client
+export type Auth = typeof auth;
 ```
-tests/
-├── unit/
-│   ├── scheduler/
-│   │   ├── helpers.test.ts
-│   │   └── deactivation.test.ts
-│   └── utils.test.ts
-├── integration/
-│   └── routes.test.ts
-└── fixtures/
-    └── reminders.ts
+
+### Step 4.3: Create Auth Handler for Elysia
+
+**File:** `src/auth/handler.ts`
+
+```typescript
+import { auth } from "./index";
+
+/**
+ * Handle all /api/auth/* requests
+ * Better Auth handles routing internally
+ */
+export async function handleAuthRequest(request: Request): Promise<Response> {
+  return auth.handler(request);
+}
 ```
 
-### Step 5.2: Priority Test Cases
+### Step 4.4: Create Auth Middleware
 
-1. **Deactivation logic**: Test all conditions that should deactivate a reminder
-2. **Alert timing**: Test that alerts fire at correct times
-3. **Recurring calculations**: Test cron parsing and next occurrence calculation
-4. **API endpoints**: Basic CRUD operations
+**File:** `src/auth/middleware.ts`
 
-### Step 5.3: Test Scripts in package.json
+```typescript
+import type { Context } from "elysia";
+import { auth } from "./index";
 
-```json
-{
-  "scripts": {
-    "test": "bun test",
-    "test:watch": "bun test --watch"
+/**
+ * Middleware to require authentication.
+ * Returns user info if authenticated, 401 if not.
+ */
+export async function requireAuth({ request, set }: Context) {
+  const session = await auth.api.getSession({
+    headers: request.headers,
+  });
+
+  if (!session) {
+    set.status = 401;
+    return { error: "Unauthorized - Please sign in" };
+  }
+
+  // Attach user to request for later use
+  return { user: session.user };
+}
+
+/**
+ * Get current user (optional - doesn't require auth)
+ */
+export async function getCurrentUser(request: Request) {
+  const session = await auth.api.getSession({
+    headers: request.headers,
+  });
+  return session?.user || null;
+}
+```
+
+### Step 4.5: Create Admin Seeding Script
+
+Since registration is disabled by default, create your admin account via script:
+
+**File:** `scripts/create-admin.ts`
+
+```typescript
+import { auth } from "../src/auth";
+
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const ADMIN_NAME = process.env.ADMIN_NAME || "Admin";
+
+if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+  console.error("Error: ADMIN_EMAIL and ADMIN_PASSWORD environment variables required");
+  console.error("Usage: ADMIN_EMAIL=you@example.com ADMIN_PASSWORD=secret bun run scripts/create-admin.ts");
+  process.exit(1);
+}
+
+async function createAdmin() {
+  try {
+    const result = await auth.api.signUpEmail({
+      body: {
+        email: ADMIN_EMAIL,
+        password: ADMIN_PASSWORD,
+        name: ADMIN_NAME,
+      },
+    });
+
+    console.log("✅ Admin account created successfully!");
+    console.log(`   Email: ${ADMIN_EMAIL}`);
+    console.log(`   Name: ${ADMIN_NAME}`);
+    console.log("\nYou can now sign in at your app's login page.");
+  } catch (error: any) {
+    if (error.message?.includes("already exists")) {
+      console.log("ℹ️  Admin account already exists");
+    } else {
+      console.error("❌ Error creating admin:", error.message || error);
+      process.exit(1);
+    }
+  }
+}
+
+createAdmin();
+```
+
+### Step 4.6: Update index.ts with Auth Routes
+
+**File:** `index.ts` (updated)
+
+```typescript
+import { Elysia } from "elysia";
+import { cors } from "@elysiajs/cors";
+import { handleAuthRequest } from "./src/auth/handler";
+import { requireAuth } from "./src/auth/middleware";
+import { routes } from "./src/route-handlers";
+import { webhookReminderAlertRoute } from "./src/route-handlers/webhook-reminder-alert";
+import { scheduler } from "./src/scheduler/scheduler-service";
+
+const PORT = process.env.PORT || 8080;
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3000";
+
+const app = new Elysia()
+  .use(
+    cors({
+      origin: CORS_ORIGIN,
+      allowedHeaders: ["Content-Type", "Cookie"],
+      methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+      credentials: true, // Important for cookies!
+    })
+  )
+  .onError(({ error, set }) => {
+    console.error(error);
+    set.status = 500;
+    return { error: "Internal Server Error" };
+  })
+
+  // ============ PUBLIC ROUTES ============
+
+  // Health check (for Render)
+  .get("/health", () => ({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+  }))
+
+  // Better Auth handles all /api/auth/* routes
+  .all("/api/auth/*", ({ request }) => handleAuthRequest(request))
+
+  // QStash webhook (secured by signature verification)
+  .post("/webhooks/reminder-alert", webhookReminderAlertRoute)
+
+  // ============ PROTECTED ROUTES ============
+
+  // All /reminders routes require authentication
+  .group("/reminders", (app) =>
+    app
+      .onBeforeHandle(requireAuth)
+      .get("/", routes.getActiveRemindersRoute)
+      .get("/all", routes.getAllRemindersRoute)
+      .get("/:id", routes.getReminderByIdRoute)
+      .post("/", routes.createReminderRoute)
+      .put("/:id", routes.updateReminderRoute)
+      .delete("/:id", routes.deleteReminderRoute)
+      .delete("/bulk", routes.deleteRemindersBulkRoute)
+  )
+
+  .listen(PORT);
+
+console.log(`Server running at http://localhost:${PORT}`);
+
+// Graceful shutdown
+process.on("SIGTERM", () => {
+  console.log("Shutting down...");
+  process.exit(0);
+});
+```
+
+### Step 4.7: Update CORS Origin in Environment
+
+**File:** `.env.example` (update)
+
+```bash
+# CORS - Your frontend URL
+# Local development
+CORS_ORIGIN=http://localhost:3000
+# Production (update with your actual frontend URL)
+# CORS_ORIGIN=https://your-frontend.vercel.app
+```
+
+### Step 4.8: Frontend Auth Integration
+
+In your React/frontend app, use Better Auth's client:
+
+```bash
+# In your frontend project
+bun add better-auth
+```
+
+**File:** (frontend) `src/lib/auth-client.ts`
+
+```typescript
+import { createAuthClient } from "better-auth/client";
+
+export const authClient = createAuthClient({
+  baseURL: process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080",
+});
+
+// Helper functions
+export const signIn = authClient.signIn.email;
+export const signUp = authClient.signUp.email;
+export const signOut = authClient.signOut;
+export const getSession = authClient.getSession;
+```
+
+**Example login page:**
+
+```typescript
+import { signIn } from "@/lib/auth-client";
+
+async function handleLogin(email: string, password: string) {
+  const result = await signIn({
+    email,
+    password,
+  });
+
+  if (result.error) {
+    alert(result.error.message);
+  } else {
+    // Redirect to dashboard
+    window.location.href = "/dashboard";
   }
 }
 ```
 
+**Making authenticated API calls:**
+
+```typescript
+// Cookies are automatically sent with credentials: "include"
+const response = await fetch("https://your-api.onrender.com/reminders", {
+  credentials: "include", // This sends the session cookie
+});
+```
+
+### Step 4.9: Disable Public Registration (Security)
+
+For personal use, you don't want random people creating accounts. Better Auth doesn't have a built-in "disable registration" flag, so we handle it at the route level:
+
+**File:** `src/auth/index.ts` (update)
+
+```typescript
+import { betterAuth } from "better-auth";
+import Database from "bun:sqlite";
+
+const DB_PATH = process.env.DATABASE_PATH || "reminders.db";
+const ALLOW_REGISTRATION = process.env.ALLOW_REGISTRATION === "true";
+
+export const auth = betterAuth({
+  database: new Database(DB_PATH),
+  emailAndPassword: {
+    enabled: true,
+    requireEmailVerification: false,
+    // Block sign-ups unless explicitly allowed
+    async onSignUp({ email }) {
+      if (!ALLOW_REGISTRATION) {
+        throw new Error("Registration is disabled. Contact admin.");
+      }
+    },
+  },
+  session: {
+    expiresIn: 60 * 60 * 24 * 30,
+    updateAge: 60 * 60 * 24,
+  },
+  trustedOrigins: [
+    process.env.CORS_ORIGIN || "http://localhost:3000",
+  ],
+});
+```
+
+**To create new users:**
+1. Temporarily set `ALLOW_REGISTRATION=true`
+2. Or use the `scripts/create-admin.ts` script directly
+
+### Step 4.10: Environment Variables Update
+
+Add to `.env.example`:
+
+```bash
+# Auth
+ALLOW_REGISTRATION=false  # Set to true temporarily to create new accounts
+
+# For create-admin script
+ADMIN_EMAIL=your-email@example.com
+ADMIN_PASSWORD=your-secure-password
+ADMIN_NAME=Your Name
+```
+
+### Step 4.11: Database Schema (Auto-created)
+
+Better Auth automatically creates these tables on first run:
+- `user` - User accounts
+- `session` - Active sessions
+- `account` - OAuth accounts (not used for email/password)
+
+No manual migration needed!
+
+### Testing Phase 4
+
+1. **Start server:**
+   ```bash
+   bun run index.ts
+   ```
+
+2. **Create admin account:**
+   ```bash
+   ADMIN_EMAIL=you@example.com ADMIN_PASSWORD=secret123 bun run scripts/create-admin.ts
+   ```
+
+3. **Test sign in (via curl or frontend):**
+   ```bash
+   curl -X POST http://localhost:8080/api/auth/sign-in/email \
+     -H "Content-Type: application/json" \
+     -d '{"email": "you@example.com", "password": "secret123"}' \
+     -c cookies.txt
+
+   # Use the session cookie
+   curl http://localhost:8080/reminders \
+     -b cookies.txt
+   ```
+
+4. **Test unauthorized access:**
+   ```bash
+   curl http://localhost:8080/reminders
+   # Should return 401 Unauthorized
+   ```
+
+### Security Checklist
+
+- [x] Passwords hashed with bcrypt (Better Auth default)
+- [x] Session stored in httpOnly cookie (not accessible via JavaScript)
+- [x] CORS restricted to your frontend domain
+- [x] Registration disabled by default
+- [x] QStash webhook secured by signature verification
+- [x] No credentials exposed in browser network tab
+
 ---
 
-## Phase 6: Production Hardening
+## Phase 5: Dockerization and Render Deployment
+
+**Priority: HIGH** | **Risk: LOW** | **Complexity: LOW**
+
+### Step 5.1: Create Dockerfile
+
+**File:** `Dockerfile`
+
+```dockerfile
+FROM oven/bun:1 AS base
+WORKDIR /app
+
+# Install dependencies
+FROM base AS install
+COPY package.json bun.lock* ./
+RUN bun install --frozen-lockfile --production
+
+# Final image
+FROM base AS release
+COPY --from=install /app/node_modules ./node_modules
+COPY . .
+
+# Create data directory for SQLite
+RUN mkdir -p /app/data
+
+ENV NODE_ENV=production
+ENV PORT=8080
+
+EXPOSE 8080
+
+CMD ["bun", "run", "index.ts"]
+```
+
+### Step 5.2: Create .dockerignore
+
+**File:** `.dockerignore`
+
+```
+node_modules
+.git
+.gitignore
+*.md
+.env
+.env.*
+reminders.db
+reminders.db-*
+*.log
+.DS_Store
+```
+
+### Step 5.3: Update Database Path for Persistence
+
+**File:** `src/db.ts` (update)
+
+```typescript
+import { Database } from "bun:sqlite";
+
+const DB_PATH = process.env.DATABASE_PATH || "reminders.db";
+export const db = new Database(DB_PATH);
+
+// ... rest of schema creation
+```
+
+### Step 5.4: Add Health Check
+
+**File:** `index.ts` (update)
+
+```typescript
+.get("/health", () => ({
+  status: "ok",
+  timestamp: new Date().toISOString(),
+}))
+```
+
+### Step 5.5: Create render.yaml
+
+**File:** `render.yaml`
+
+```yaml
+services:
+  - type: web
+    name: reminders-server
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 8080
+      # Auth
+      - key: CORS_ORIGIN
+        sync: false  # Your frontend URL
+      - key: ALLOW_REGISTRATION
+        value: "false"
+      # QStash
+      - key: QSTASH_TOKEN
+        sync: false
+      - key: QSTASH_CURRENT_SIGNING_KEY
+        sync: false
+      - key: QSTASH_NEXT_SIGNING_KEY
+        sync: false
+      - key: WEBHOOK_BASE_URL
+        sync: false
+      # Database
+      - key: DATABASE_PATH
+        value: /app/data/reminders.db
+      # Email
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SENDGRID_FROM_EMAIL
+        sync: false
+      - key: MAIL_SERVICE
+        value: sendgrid
+    disk:
+      name: reminders-data
+      mountPath: /app/data
+      sizeGB: 1
+```
+
+### Step 5.6: Create .env.example
+
+**File:** `.env.example`
+
+```bash
+# Server
+NODE_ENV=development
+PORT=8080
+
+# Auth (Better Auth)
+CORS_ORIGIN=http://localhost:3000  # Your frontend URL
+ALLOW_REGISTRATION=false  # Set true temporarily to create accounts
+
+# Admin account (for create-admin script)
+ADMIN_EMAIL=your-email@example.com
+ADMIN_PASSWORD=your-secure-password
+ADMIN_NAME=Your Name
+
+# QStash (Upstash) - Free scheduler
+# Get from: console.upstash.com -> QStash
+QSTASH_TOKEN=
+QSTASH_CURRENT_SIGNING_KEY=
+QSTASH_NEXT_SIGNING_KEY=
+
+# Webhook URL (your Render URL in production)
+WEBHOOK_BASE_URL=https://your-app.onrender.com
+
+# Database (for Docker/Render)
+DATABASE_PATH=./reminders.db
+
+# Email - SendGrid (100 free emails/day)
+MAIL_SERVICE=sendgrid
+SENDGRID_API_KEY=
+SENDGRID_FROM_EMAIL=
+
+# Development only - use polling instead of QStash
+USE_POLLING=true
+```
+
+### Step 5.7: Deployment Steps
+
+1. **Push to GitHub**
+   ```bash
+   git add .
+   git commit -m "Prepare for Render deployment"
+   git push origin main
+   ```
+
+2. **Create Render Account**
+   - Go to [render.com](https://render.com)
+   - Sign up (free)
+
+3. **Create New Web Service**
+   - Click "New" → "Web Service"
+   - Connect your GitHub repository
+   - Select "Docker" as runtime
+   - Select "Free" plan
+
+4. **Add Disk (Important for SQLite!)**
+   - Go to service settings → "Disks"
+   - Add disk: name=`reminders-data`, mount=`/app/data`, size=1GB
+
+5. **Set Environment Variables**
+   - `NODE_ENV` = production
+   - `PORT` = 8080
+   - `CORS_ORIGIN` = your frontend URL
+   - `ALLOW_REGISTRATION` = false
+   - `DATABASE_PATH` = /app/data/reminders.db
+   - `WEBHOOK_BASE_URL` = https://your-app.onrender.com
+   - `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` from Upstash
+   - `SENDGRID_API_KEY`, `SENDGRID_FROM_EMAIL` for emails
+
+6. **Deploy**
+   - Render will build and deploy automatically
+   - Wait for "Live" status
+
+7. **Create Admin Account**
+   You have two options:
+
+   **Option A: Via Render Shell**
+   - Go to your service → "Shell"
+   - Run: `ADMIN_EMAIL=you@example.com ADMIN_PASSWORD=secret123 bun run scripts/create-admin.ts`
+
+   **Option B: Temporarily Enable Registration**
+   - Set `ALLOW_REGISTRATION=true` in env vars
+   - Sign up via your frontend
+   - Set `ALLOW_REGISTRATION=false` again
+
+8. **Test**
+   ```bash
+   # Health check
+   curl https://your-app.onrender.com/health
+
+   # Sign in (get session cookie)
+   curl -X POST https://your-app.onrender.com/api/auth/sign-in/email \
+     -H "Content-Type: application/json" \
+     -d '{"email": "you@example.com", "password": "secret123"}' \
+     -c cookies.txt
+
+   # Create reminder (with session cookie)
+   curl -X POST https://your-app.onrender.com/reminders \
+     -H "Content-Type: application/json" \
+     -b cookies.txt \
+     -d '{"title": "Test", "date": "2025-01-15T10:00:00Z", "description": "Test reminder", "alerts": [{"id": "1", "time": 60000}]}'
+   ```
+
+---
+
+## Phase 6: Code Quality (Optional)
 
 **Priority: LOW** | **Risk: LOW** | **Complexity: LOW**
 
-### Step 6.1: Rate Limiting
+### Step 6.1: Add Structured Logging
+
+**File:** `src/logger.ts`
 
 ```typescript
-import { rateLimit } from 'elysia-rate-limit';
+type LogLevel = "debug" | "info" | "warn" | "error";
 
-app.use(rateLimit({
-  max: 100,
-  duration: 60000, // 1 minute
-}));
+const LOG_LEVEL = (process.env.LOG_LEVEL || "info") as LogLevel;
+const LEVELS: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+
+function log(level: LogLevel, message: string, context?: Record<string, unknown>) {
+  if (LEVELS[level] < LEVELS[LOG_LEVEL]) return;
+
+  const entry = {
+    timestamp: new Date().toISOString(),
+    level,
+    message,
+    ...context,
+  };
+
+  console.log(JSON.stringify(entry));
+}
+
+export const logger = {
+  debug: (msg: string, ctx?: Record<string, unknown>) => log("debug", msg, ctx),
+  info: (msg: string, ctx?: Record<string, unknown>) => log("info", msg, ctx),
+  warn: (msg: string, ctx?: Record<string, unknown>) => log("warn", msg, ctx),
+  error: (msg: string, ctx?: Record<string, unknown>) => log("error", msg, ctx),
+};
 ```
 
-### Step 6.2: Request ID Tracking
+### Step 6.2: Remove Dead Code
 
-Add request IDs for tracing:
-
-```typescript
-.onBeforeHandle(({ request, set }) => {
-  const requestId = crypto.randomUUID();
-  set.headers['x-request-id'] = requestId;
-})
-```
-
-### Step 6.3: API Documentation
-
-Consider adding Swagger/OpenAPI documentation using `@elysiajs/swagger`:
-
-```typescript
-import { swagger } from '@elysiajs/swagger';
-
-app.use(swagger({
-  documentation: {
-    info: {
-      title: 'Reminders API',
-      version: '1.0.0',
-    },
-  },
-}));
-```
+- Remove commented-out code in `index.ts`
+- Remove unused imports
 
 ---
 
-## Implementation Order (Recommended)
+## Implementation Order
 
-| Order | Phase | Status | Reason |
-|-------|-------|--------|--------|
-| 1 | Phase 1 (checkReminders refactor) | ✅ **COMPLETE** | Highest impact on maintainability, foundation for other changes |
-| 2 | Phase 5 (Testing) | 🔜 Next | Tests will protect against regressions during future changes |
-| 3 | Phase 2 (Scheduler resilience) | Pending | Improves reliability with minimal risk |
-| 4 | Phase 3 (Code quality) | Pending | Quick wins, low risk |
-| 5 | Phase 4 (Database) | Pending | Lower priority, current DB setup works fine |
-| 6 | Phase 6 (Production hardening) | Pending | Nice to have, implement when deploying to production |
-
----
-
-## What to Avoid (Keeping it Simple)
-
-1. **Don't add Redis/job queues** - Overkill for this use case
-2. **Don't switch to a different database** - SQLite is perfect for this scale
-3. **Don't add an ORM** - Direct SQL with prepared statements is fine
-4. **Don't over-abstract** - Keep the codebase readable, not enterprise-y
-5. **Don't add microservices** - This is a single service and should stay that way
+| Order | Phase | Effort | Notes |
+|-------|-------|--------|-------|
+| 1 | Phase 1 (checkReminders refactor) | - | ✅ COMPLETE |
+| 2 | Phase 4 (Better Auth) | 2-3 hours | Security first - protect your data |
+| 3 | Phase 2 (QStash Integration) | 2-3 hours | Replace polling with events |
+| 4 | Phase 5 (Dockerization) | 1-2 hours | Deploy to Render |
+| 5 | Phase 3 (Repository Pattern) | 2-3 hours | Nice to have, do later |
+| 6 | Phase 6 (Code Quality) | 1 hour | Optional cleanup |
 
 ---
 
-## Success Metrics
+## Quick Start (Minimum Viable Deployment)
 
-After implementing these phases, you should be able to:
+Recommended order for a secure deployment:
 
-1. **Read checkReminders() and understand it in under 2 minutes**
-2. **Add a new deactivation rule in under 5 minutes**
-3. **Know if the scheduler is healthy via the /health endpoint**
-4. **Run tests to verify nothing broke after changes**
-5. **Deploy with confidence using Docker**
+1. **Implement Better Auth** (Phase 4) - 2-3 hours
+   - Install better-auth
+   - Create auth config, handler, middleware
+   - Create admin account script
+   - Update index.ts with auth routes
+
+2. **Set up QStash** (Phase 2) - 2-3 hours
+   - Create Upstash account
+   - Implement scheduler and webhook endpoint
+   - Update create-reminder to schedule alerts
+
+3. **Dockerize and Deploy** (Phase 5) - 1-2 hours
+   - Create Dockerfile and render.yaml
+   - Push to GitHub → Connect to Render
+   - Add disk for SQLite persistence
+   - Set environment variables
+   - Create admin account on production
+
+**Total: ~6-8 hours to fully secured app on Render for FREE**
 
 ---
 
-## Appendix: Scheduler Alternatives Analysis
+## Free Tier Limitations to Know
 
-For reference, here's why different scheduling approaches were considered and rejected:
+| Service | Free Tier | Your Usage |
+|---------|-----------|------------|
+| **Render** | 750 hours/month, sleeps after 15 min | Fine with QStash |
+| **Upstash QStash** | 1,000 messages/day | ~2/week |
+| **SendGrid** | 100 emails/day | ~2/week |
+| **Render Disk** | 1GB included | Plenty |
 
-| Approach | Pros | Cons | Verdict |
-|----------|------|------|---------|
-| `setInterval` | Simple, no dependencies, works | Can overlap, no health visibility | **Use with resilience wrapper** |
-| `node-cron` | Clock-aligned, familiar cron syntax | Min precision is 1 minute, overkill | Not suitable for 3s intervals |
-| Bull/BullMQ | Robust, retries, visibility | Requires Redis, complex | Overkill |
-| Bun.cron | Native, no dependencies | Limited documentation | Future consideration |
-| System cron | OS-level, reliable | Requires shell script, external | Not suitable for this app |
+**Total Monthly Cost: $0**
 
-The recommendation is to **keep `setInterval` but wrap it with proper error handling, overlap prevention, and health monitoring**.
+---
+
+## Sources and References
+
+- [QStash Announcement](https://upstash.com/blog/qstash-announcement)
+- [Building Reminders with QStash](https://upstash.com/blog/qstash-reminder)
+- [QStash Pricing](https://upstash.com/pricing/qstash)
+- [Render.com Free Tier](https://community.render.com/t/do-web-services-on-a-free-tier-go-to-sleep-after-some-time-inactive/3303)
+- [Email Scheduler with QStash](https://upstash.com/blog/email-scheduler-qstash)
