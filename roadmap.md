@@ -672,6 +672,20 @@ const repo = getReminderRepository();
 const results = repo.findAll();
 ```
 
+### Step 3.5: App Settings Repository
+
+A second repository was added for the `app_settings` key/value table, following the same three-file pattern as the reminder repository. It stores internal state that needs to survive server restarts (e.g. the QStash cleanup schedule ID).
+
+- **Interface:** `src/repositories/app-settings-repository.interface.ts` — `get(key): string | null`, `set(key, value): void`
+- **Implementation:** `src/repositories/sqlite-app-settings-repository.ts`
+- **Factory:** `getAppSettingsRepository()` exported from `src/repositories/index.ts`
+
+### Repository Pattern Rule
+
+> **All database reads and writes must go through a repository.** Never import `db` from `src/db.ts` outside of a repository implementation class. This keeps the SQLite dependency contained so the backing store can be swapped (e.g. to PostgreSQL) without touching business logic.
+>
+> Adding a new table requires exactly three things: an interface file, an SQLite implementation class, and a factory function in `src/repositories/index.ts`.
+
 ---
 
 ## Phase 4: Authentication with Better Auth

@@ -51,3 +51,4 @@ export * from "./swaggerUpdateReminder";
 export * from "./swaggerDeleteReminder";
 export * from "./swaggerDeleteRemindersBulk";
 export * from "./swaggerWebhookAlert";
+export * from "./swaggerWebhookCleanup";

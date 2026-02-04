@@ -20,6 +20,53 @@ docker build -t reminders-server .
 docker run -p 8080:8080 reminders-server
 ```
 
+## Testing
+
+**IMPORTANT: Tests must be run before committing any changes to ensure nothing is broken.**
+
+**Run all tests:**
+```bash
+bun test
+```
+
+**Run tests in watch mode (during development):**
+```bash
+bun test --watch
+```
+
+**Run tests with coverage:**
+```bash
+bun test --coverage
+```
+
+**Run specific test file:**
+```bash
+bun test tests/integration/reminders.test.ts
+```
+
+### Test Organization
+
+```
+tests/
+├── setup.ts              # Test setup, in-memory database
+├── test-utils.ts         # Shared utilities and factories
+├── integration/          # API endpoint tests
+│   ├── reminders.test.ts # CRUD operations
+│   ├── auth.test.ts      # Authentication tests
+│   └── webhooks.test.ts  # Webhook handler tests
+└── unit/                 # Unit tests
+    ├── schemas.test.ts   # Zod validation
+    ├── scheduler-helpers.test.ts
+    └── repository.test.ts
+```
+
+### Testing Rules for Claude
+
+1. **Always run tests after making code changes** - Before completing any task that modifies code, run `bun test` to ensure all tests pass
+2. **Add tests for new functionality** - When adding new features or endpoints, add corresponding tests
+3. **Fix broken tests immediately** - If tests fail after your changes, fix them before moving on
+4. **Do not commit with failing tests** - All tests must pass before committing
+
 ## Architecture Overview
 
 This is a **Bun-first TypeScript server** built with **Elysia.js** for managing reminder notifications. The architecture follows a clean, functional design with modular route handlers.
@@ -33,8 +80,8 @@ This is a **Bun-first TypeScript server** built with **Elysia.js** for managing 
 
 **Database:** SQLite via `bun:sqlite`
 - Single file database: `reminders.db`
-- No ORM - uses direct SQL with prepared statements
 - Schema defined in `src/db.ts`
+- All queries are encapsulated in repositories (`src/repositories/`). Never import `db` directly outside of a repository implementation.
 
 **Scheduler:** `src/check-reminders.ts`
 - Background process that checks for due reminders
@@ -48,6 +95,11 @@ This is a **Bun-first TypeScript server** built with **Elysia.js** for managing 
 - Shared logic in `route-helpers.ts` (getReminders, getReminderById)
 
 ### Key Architectural Patterns
+
+**Repository Pattern:**
+- Every table has its own interface (`src/repositories/*-repository.interface.ts`) and SQLite implementation (`src/repositories/sqlite-*-repository.ts`).
+- Concrete implementations are the **only** place that imports `db` from `src/db.ts`. All other code obtains a repository via the factory functions exported from `src/repositories/index.ts` (e.g. `getReminderRepository()`, `getAppSettingsRepository()`).
+- Adding a new table means: (1) interface, (2) SQLite class, (3) factory in `index.ts`. Nothing else should touch the database directly.
 
 **DTO Transformation Pattern:**
 - Database stores arrays/objects as JSON strings, booleans as integers (0/1)
@@ -132,7 +184,7 @@ Optional:
 ## Important Implementation Notes
 
 1. **This is Bun, not Node.js** - Use `bun run` commands, leverage Bun's native SQLite bindings
-2. **No ORM** - Write SQL directly, use prepared statements for security
+2. **No ORM, but use repositories** - Raw SQL lives only inside `src/repositories/sqlite-*.ts`. Every other file reaches the database through a repository factory (`getReminderRepository()`, `getAppSettingsRepository()`, etc.). Never import `db` outside a repository.
 3. **Always transform DTOs** - Use `getReminders()` or `getReminderById()` to ensure proper type conversion from database
 4. **Scheduler is independent** - Background reminder checking runs on its own interval, separate from HTTP requests
 5. **Cron syntax for recurrence** - Standard cron expressions (e.g., `0 9 * * 1-5` for weekdays at 9am)
@@ -140,6 +192,7 @@ Optional:
 7. **Type safety first** - TypeScript strict mode enabled, Zod provides runtime validation
 8. **Modular handlers** - New routes should follow the pattern: create file in `route-handlers/`, export from `route-handlers/index.ts`, register in `index.ts`
 9. **Keep Swagger in sync** - Whenever you add, remove, or modify API endpoints, update the corresponding route definition in `index.ts` (search for `.get`, `.post`, `.put`, `.delete` with the `detail:` property). Swagger documentation must stay current with actual API behavior. See the swagger configuration section at the top of `index.ts` for examples.
+10. **Run tests before completing tasks** - After making any code changes, run `bun test` to ensure nothing is broken. Never leave a task incomplete with failing tests.
 
 ## Swagger/OpenAPI Integration
 

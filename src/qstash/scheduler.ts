@@ -1,4 +1,5 @@
 import { qstash, getWebhookBaseUrl } from "./client";
+import { getAppSettingsRepository } from "../repositories";
 
 interface ScheduleReminderOptions {
   reminderId: number;
@@ -102,6 +103,49 @@ export async function scheduleRecurringReminder(
       error,
     );
     return { success: false, error: (error as Error).message };
+  }
+}
+
+const CLEANUP_SCHEDULE_ID = "reminders-daily-cleanup";
+const CLEANUP_CRON = "0 0 * * *"; // Every day at midnight UTC
+
+/**
+ * Ensures the daily cleanup cron schedule exists in QStash.
+ * Persists the schedule ID in app_settings so the QStash API is only
+ * called once — subsequent cold starts skip it entirely.
+ */
+export async function ensureCleanupSchedule(): Promise<void> {
+  if (!qstash) {
+    console.log("[DEV] QStash not configured - cleanup schedule not created");
+    return;
+  }
+
+  // Already registered in a previous run — nothing to do.
+  const settings = getAppSettingsRepository();
+  if (settings.get("cleanup_schedule_id")) {
+    console.log("Cleanup schedule already registered - skipping");
+    return;
+  }
+
+  const webhookUrl = `${getWebhookBaseUrl()}/webhooks/cleanup`;
+
+  try {
+    await qstash.schedules.create({
+      scheduleId: CLEANUP_SCHEDULE_ID,
+      destination: webhookUrl,
+      cron: CLEANUP_CRON,
+      headers: {
+        "x-api-key": process.env.APP_API_KEY || "",
+      },
+      retries: 3,
+    });
+
+    // Persist so we don't call QStash again on the next cold start.
+    settings.set("cleanup_schedule_id", CLEANUP_SCHEDULE_ID);
+
+    console.log(`Cleanup schedule created (cron: ${CLEANUP_CRON})`);
+  } catch (error) {
+    console.error("Failed to ensure cleanup schedule:", error);
   }
 }
 

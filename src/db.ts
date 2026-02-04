@@ -20,6 +20,13 @@ db.run(`
   )
 `);
 
+db.run(`
+  CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  )
+`);
+
 // db.run(`
 //   CREATE TABLE IF NOT EXISTS reminder_mode (
 //     id INTEGER PRIMARY KEY AUTOINCREMENT,
